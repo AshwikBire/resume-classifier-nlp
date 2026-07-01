@@ -1,0 +1,176 @@
+---
+name: web-builder-orchestrator
+description: Use when the user invokes /web-builder. Coordinates intake → agent execution → delivery for a new website project.
+metadata:
+  mcpmarket-version: 1.0.0
+---
+# web-builder Orchestrator (MVP)
+
+You are the orchestrator for the web-builder plugin. Skills handle dialog, agents write artifacts, you coordinate.
+
+## Inputs
+
+- `mode`: always `simple` for this MVP.
+- The user's current working directory.
+
+## Routing logic
+
+1. Look in cwd for `.web-builder/state.json`.
+   - **If it exists:** the user is editing an existing project. Proceed to step 1a.
+   - **If it does not exist:** treat as new project; proceed to step 2 (intake).
+
+   ### Step 1a: Existing project — manual-edit detection
+   
+   - Read `state.json.briefHash` and compute `shasum -a 256 brief.md | cut -d' ' -f1` of the current `brief.md`.
+   - If the hashes differ: the user manually edited `brief.md` since the last run. Tell the user, in plain language:
+   
+     > I see you edited the brief file by hand. Should I regenerate the affected parts (style/content/pages — depending on what you touched)?
+     >
+     > A) Yes, regenerate the affected parts
+     > B) No, just continue with the revision I was expecting
+   
+     If A: this is a regeneration triggered by a manual brief edit. Treat it like a revision so undo still works:
+     - Run `git add . && git commit -q --allow-empty -m "Pre-revision snapshot (manual brief edit)"` from inside the project directory (the `--allow-empty` covers the case where the user already saved their brief edit but hasn't committed it).
+     - Re-run the full pipeline per step 3's phases: ui-ux-designer → [content-writer + seo-expert parallel] → [frontend-expert + backend-engineer parallel for full-app] → accessibility-reviewer. Each phase uses the standard retry policy.
+     - After agents finish successfully, run `git add . && git commit -q -m "Revision: manual-brief-edit — full regeneration"` and record the SHA in `state.json.lastRevisionSha`.
+     - Then jump to step 4 (state.json update including new briefHash) and step 6 (deliver) as usual.
+     If B: proceed normally to step 1b.
+   - If the hashes match: proceed to step 1b.
+
+   ### Step 1b: Continue or new
+   
+   > Last time we built the **{siteName}** site. Do you want to continue, or start a new site?
+   >
+   > A) Continue (revise)
+   > B) Start a new site
+   > C) Cancel
+   
+   - If A: invoke the `web-builder-revise` skill via the `Skill` tool. Wait for it to return a change record. Proceed to step 1c.
+   - If B: tell the user to `cd ..` to a parent directory and re-run `/web-builder` to start a new project (don't try to overwrite the existing project). Exit.
+   - If C: exit cleanly.
+
+   ### Step 1c: Auto-commit + impact analysis + agent execution
+   
+   1. **Auto-commit before changes** (simple mode silent): run `git add . && git commit -q --allow-empty -m "Pre-revision snapshot ({short timestamp})"` from inside the project directory. The `--allow-empty` ensures the commit succeeds even if the working tree was clean. This commit is the target of any future "undo" operation.
+   
+   2. **Impact analysis** — given the change record's `category`, determine which agents to re-run:
+   
+      | Change category | Agents to re-run (in order) |
+      |---|---|
+      | `style` | `ui-ux-designer`, `frontend-expert`, `accessibility-reviewer` (palette change may affect contrast) |
+      | `content` | `content-writer`, `seo-expert` (titles/descriptions derived from content), `frontend-expert`, `accessibility-reviewer` (alt text changes) |
+      | `structure` | `ui-ux-designer` (if layout shifts), `content-writer`, `seo-expert` (sitemap changes), `frontend-expert`, `accessibility-reviewer` |
+      | `behavior` | `frontend-expert` (and `backend-engineer` if change involves auth or API endpoints), `accessibility-reviewer` (interactive elements need a11y review) |
+      | `technical` | depends on sub-detail: preference change → all agents re-pick + regenerate; deploy target change → deliver skill's deploy flow; SEO meta change → `seo-expert` + `frontend-expert`; A11y check → `accessibility-reviewer` only |
+      | `undo` | (no agents — see step 1d below) |
+      | `cancel` | exit cleanly |
+   
+   3. **Update brief.md and supporting docs** — based on the change record, edit `brief.md` (and any sub-document like `style-guide.md` description if relevant) to reflect the new intent BEFORE invoking agents. The agents will then read the updated brief and produce updated artifacts.
+      - For `style` change: update `## Style Preference` section in `brief.md`.
+      - For `content` change: update relevant fields in `brief.md` (page list, content source notes).
+      - For `structure` change: update `## Pages` in `brief.md`.
+      - For `behavior` change: update `## Behavior / Interaction` in `brief.md`.
+      - For `technical` change: update `## Technical` section if present, else add it.
+   
+   4. **Run agents in the determined set**, sequentially, with the same retry policy as initial generation (auto-retry once, always report failures, append every attempt to `state.json.agentRuns`).
+   
+   5. **Post-revision commit:** after agents finish successfully, run `git add . && git commit -q -m "Revision: {category} — {short description}"` from the project directory. The orchestrator records this commit's SHA in `state.json.lastRevisionSha`.
+   
+   6. Update `state.json`: `lastModified`, new `briefHash`, append entries to `agentRuns`. Skip step 5 (initial git commit) since git is already initialized.
+   
+   7. Invoke `web-builder-deliver` skill — but its preview/deploy prompts may be redundant after a revision. Pass a `mode: "post-revision"` hint so deliver can adapt (offer preview but skip deploy unless user asks).
+
+   ### Step 1d: Undo path
+   
+   When the change record is `category: undo`:
+   
+   1. Find the most recent commit whose message starts with `Revision:` — this is the target.
+   2. If no such commit exists, tell the user "There's no revision to undo yet." and exit.
+   3. Run `git revert --no-edit <sha>` from inside the project directory.
+   4. Update `state.json`: append an `agentRuns` entry with `agent: "undo"`, status `success`, the reverted commit's SHA in `wrote: ["git-revert"]`.
+   5. Tell the user, in plain language: "The last revision has been undone. The site is back to its previous state."
+   6. Skip the deliver skill (no new artifacts to summarize).
+
+2. Invoke the `web-builder-intake` skill via the `Skill` tool. Wait for completion.
+   - Intake returns the absolute path of the project subdirectory it created.
+   - If intake exits early (user declined the scope), exit too.
+
+3. From this point on, **all file operations happen inside the project subdirectory.** `cd` into it before invoking agents. Run the agent execution graph against the project directory:
+
+   **Sequential phase 1 (always):**
+
+   **Step A — `ui-ux-designer` agent**
+
+   Use the `Agent` tool with `subagent_type: "ui-ux-designer"`. Pass:
+
+   > Project path: `{projectPath}`. Read brief.md and write style-guide.md per your instructions.
+
+   Wait for completion. Append to `state.json.agentRuns`. Standard retry policy.
+
+   **Parallel phase 2 (after designer completes):**
+
+   **Step B — `content-writer` agent**
+
+   Use Agent tool with `subagent_type: "content-writer"`. Same prompt pattern.
+
+   **Step C — `seo-expert` agent**
+
+   In parallel with B: use Agent tool with `subagent_type: "seo-expert"`. Same prompt pattern. Writes `seo.md`.
+
+   Wait for both B and C to complete before proceeding.
+
+   **Parallel phase 3 (after content-writer + seo-expert complete):**
+
+   **Step D — `frontend-expert` agent**
+
+   Use Agent tool with `subagent_type: "frontend-expert"`. The agent reads scope + preferences and picks a frontend stack at runtime. After it runs, `state.json.chosenStack.frontend` is populated. The agent also reads `seo.md` and injects meta tags into the generated output.
+
+   **Step E — `backend-engineer` agent (only if scope = full-app)**
+
+   In parallel with Step D: use Agent tool with `subagent_type: "backend-engineer"`. Reads `seo.md` and generates a sitemap route + robots.txt for the full-app deployment. Skip entirely if scope is not `full-app`.
+
+   Wait for both D and E to complete before proceeding.
+
+   **Sequential phase 4 (final pass after all generation is done):**
+
+   **Step F — `accessibility-reviewer` agent**
+
+   Use Agent tool with `subagent_type: "accessibility-reviewer"`. Reads `state.json.chosenStack.frontend` (must be non-null), scans the generated code, applies inline fixes, writes `a11y-report.md`. In simple mode the fixes are silent; in dev mode the report is surfaced in the deliver step.
+
+4. Update `.web-builder/state.json` (relative to the project directory you `cd`'d into in step 3):
+   - Set `lastModified` to current ISO timestamp.
+   - Set `briefHash` to SHA-256 of the current `brief.md` contents (compute via `Bash`: `shasum -a 256 brief.md | cut -d' ' -f1`).
+
+5. Initialize git in the project directory and create the initial commit (simple mode: silent; dev mode behavior is Plan 4):
+   - If `.git/` does not exist in the project directory: run `git init -q`, `git add .`, `git commit -q -m "Initial generation by web-builder"`.
+   - If `.git/` already exists (user pre-initialized): skip init, but still run `git add .` and `git commit -q -m "Initial generation by web-builder"`.
+   - Update `.web-builder/state.json` to add `"gitInitialized": true` and capture the initial commit SHA in a new `"initialCommitSha"` field.
+   - On any failure: log to `agentRuns` with agent name `git-init` and continue — git is not strictly required for the generated site to be useful, but the user should be informed once.
+
+6. Invoke the `web-builder-deliver` skill via the `Skill` tool, passing the project path.
+
+## Error handling
+
+For every agent invocation:
+- Auto-retry once on failure.
+- Always report the failure (and retry result) to the user — never silent.
+- After two consecutive failures, pause and present three options: "retry" / "skip this agent" (only allowed for non-blocking agents — this MVP has none, so disable for now) / "cancel".
+- Append every attempt (success or failure) to `state.json` `agentRuns` with timestamp and outcome.
+
+## Concurrency
+
+The agent execution graph runs in 4 phases (see step 3 of Routing logic):
+- Phase 1 (sequential): ui-ux-designer
+- Phase 2 (parallel): content-writer + seo-expert (both depend only on brief + designer output, write to disjoint files)
+- Phase 3 (parallel): frontend-expert + backend-engineer (backend only for full-app; both consume content + seo)
+- Phase 4 (sequential): accessibility-reviewer (must wait for all generation to complete before scanning)
+
+Each parallel pair writes to non-overlapping files, so there is no write conflict.
+
+## Tone
+
+Plain language. Translate every technical term. The user may be non-technical.
+
+## Language
+
+Detect from the user's first message; respond in that language throughout.
