@@ -18,3 +18,4 @@ Or download a pre-configured ZIP from https://app.mcpmarket.com.
 - `hook-shim.sh` — exports `MCPMARKET_*` env vars then runs `shared/sync.sh`
 
 The shared sync logic lives in `shared/sync.sh`.
+Updates for main to the layout section to provide more clarity on file structure and bugging machanism.
