@@ -21,3 +21,4 @@ The shared sync logic lives in `shared/sync.sh`.
 Updates for main to the layout section to provide more clarity on file structure and bugging machanism.
 
 feature update 2
+feature update 3
